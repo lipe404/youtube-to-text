@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YouTube to Text</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='styles.css') }}"
+    />
+  </head>
+  <body>
+    <div class="background"></div>
+    <main class="glass-card">
+      <h1>YouTube → Text</h1>
+      <p class="subtitle">
+        Cole a URL de um vídeo do YouTube e obtenha a transcrição completa
+        usando IA.
+      </p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %} {% if
+      messages %}
+      <div class="alerts">
+        {% for category, message in messages %}
+        <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+      {% endif %} {% endwith %}
+
+      <form
+        class="input-form"
+        action="{{ url_for('transcribe') }}"
+        method="POST"
+        novalidate
+      >
+        <label for="youtube_url">URL do YouTube</label>
+        <input
+          type="url"
+          id="youtube_url"
+          name="youtube_url"
+          placeholder="https://www.youtube.com/watch?v=XXXXXXXXXXX"
+          required
+          pattern="https?://(www\.)?(youtube\.com|youtu\.be)/.*"
+        />
+        <button type="submit">Transcrever</button>
+      </form>
+
+      {% if transcript %}
+      <section class="result">
+        <h2>Transcrição</h2>
+        <div class="transcript-meta">
+          <span>{{ transcript.split()|length }} palavras</span>
+          <button class="copy-btn" onclick="copyTranscript()">Copiar</button>
+        </div>
+        <pre class="transcript" id="transcript-text">{{ transcript }}</pre>
+      </section>
+      {% endif %}
+
+      <footer>
+        <small>
+          Transcrição gerada por IA (Whisper). Respeite os direitos autorais do
+          conteúdo.
+        </small>
+      </footer>
+    </main>
+
+    <script>
+      function copyTranscript() {
+        const text = document.getElementById("transcript-text").textContent;
+        navigator.clipboard.writeText(text).then(() => {
+          const btn = document.querySelector(".copy-btn");
+          const originalText = btn.textContent;
+          btn.textContent = "Copiado!";
+          setTimeout(() => {
+            btn.textContent = originalText;
+          }, 2000);
+        });
+      }
+    </script>
+  </body>
+</html>
