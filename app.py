@@ -3,12 +3,12 @@ import re
 import tempfile
 import uuid
 import shutil
-from contextlib import contextmanager
-from typing import Tuple, Optional
+from typing import Optional
 
 from flask import Flask, render_template, request, redirect, url_for, flash
 from werkzeug.utils import secure_filename
 from yt_dlp import YoutubeDL
+from youtube_transcript_api import YouTubeTranscriptApi
 from faster_whisper import WhisperModel
 import subprocess
 import imageio_ffmpeg
@@ -21,7 +21,6 @@ ALLOWED_HOSTS = {
     "m.youtube.com",
 }
 
-# Limites de recursos
 MAX_VIDEO_DURATION = 600  # 10 minutos
 MAX_VIDEO_SIZE_MB = 100  # 100 MB
 
@@ -52,46 +51,51 @@ def create_app() -> Flask:
             flash(str(exc), "error")
             return redirect(url_for("index"))
 
-        file_path = None
-        wav_path = None
-
-        try:
-            # Download apenas áudio
-            file_path = download_youtube_audio_optimized(input_url)
-
-            # Validar duração
-            duration = get_audio_duration(file_path)
-            if duration > MAX_VIDEO_DURATION:
-                raise ValueError(
-                    f"Vídeo muito longo ({int(duration)}s). Máximo: {MAX_VIDEO_DURATION}s"
-                )
-
-            # Transcrever
-            transcript_text = transcribe_with_whisper_local(file_path)
-
-            flash("Transcrição concluída com sucesso!", "success")
-            return render_template("index.html", transcript=transcript_text)
-
-        except Exception as exc:
-            error_msg = str(exc)
-
-            # Mensagens amigáveis para erros comuns
-            if "Sign in to confirm" in error_msg or "bot" in error_msg.lower():
-                error_msg = (
-                    "YouTube bloqueou a requisição (detecção de bot). "
-                    "Soluções: (1) Aguarde 10-15 minutos e tente novamente, "
-                    "(2) Use outra URL, (3) Configure cookies (veja documentação)."
-                )
-            elif "Video unavailable" in error_msg:
-                error_msg = "Vídeo indisponível, privado ou restrito por região."
-            elif "Requested format not available" in error_msg:
-                error_msg = "Formato de vídeo não disponível para download."
-
-            flash(f"Erro: {error_msg}", "error")
+        # Extrair ID do vídeo
+        video_id = extract_video_id(input_url)
+        if not video_id:
+            flash("Não foi possível extrair o ID do vídeo.", "error")
             return redirect(url_for("index"))
 
-        finally:
-            cleanup_files([file_path, wav_path])
+        transcript_text = None
+        method_used = None
+
+        # === CAMADA 1: YouTube Transcript API (MAIS RÁPIDO E CONFIÁVEL) ===
+        try:
+            transcript_text = get_transcript_from_api(video_id)
+            method_used = "YouTube Transcript API"
+        except Exception as e:
+            print(f"Transcript API falhou: {e}")
+
+        # === CAMADA 2: Download + Whisper (SE TRANSCRIPT API FALHAR) ===
+        if not transcript_text:
+            file_path = None
+            try:
+                file_path = download_youtube_audio_with_fallbacks(input_url)
+
+                duration = get_audio_duration(file_path)
+                if duration > MAX_VIDEO_DURATION:
+                    raise ValueError(
+                        f"Vídeo muito longo ({int(duration)}s). Máximo: {MAX_VIDEO_DURATION}s"
+                    )
+
+                transcript_text = transcribe_with_whisper_local(file_path)
+                method_used = "Whisper AI"
+
+            except Exception as exc:
+                error_msg = format_error_message(str(exc))
+                flash(f"Erro: {error_msg}", "error")
+                return redirect(url_for("index"))
+            finally:
+                cleanup_files([file_path])
+
+        if transcript_text:
+            flash(
+                f"✅ Transcrição concluída com sucesso! (Método: {method_used})", "success")
+            return render_template("index.html", transcript=transcript_text)
+        else:
+            flash("❌ Não foi possível obter a transcrição por nenhum método.", "error")
+            return redirect(url_for("index"))
 
     @app.route("/upload", methods=["POST"])
     def upload():
@@ -106,7 +110,6 @@ def create_app() -> Flask:
             flash("Arquivo inválido.", "error")
             return redirect(url_for("index"))
 
-        # Validar extensão
         allowed_extensions = {'.mp4', '.mp3', '.wav', '.m4a', '.webm', '.ogg'}
         file_ext = os.path.splitext(file.filename)[1].lower()
 
@@ -120,14 +123,12 @@ def create_app() -> Flask:
         temp_path = None
 
         try:
-            # Salvar temporariamente
             temp_path = os.path.join(
                 tempfile.gettempdir(),
                 f"upload_{uuid.uuid4().hex}{file_ext}"
             )
             file.save(temp_path)
 
-            # Validar tamanho
             file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
             if file_size_mb > MAX_VIDEO_SIZE_MB:
                 raise ValueError(
@@ -135,10 +136,9 @@ def create_app() -> Flask:
                     f"Máximo: {MAX_VIDEO_SIZE_MB}MB"
                 )
 
-            # Transcrever
             transcript = transcribe_with_whisper_local(temp_path)
 
-            flash("Transcrição concluída com sucesso!", "success")
+            flash("✅ Transcrição concluída com sucesso!", "success")
             return render_template("index.html", transcript=transcript)
 
         except Exception as exc:
@@ -174,10 +174,10 @@ def validate_youtube_url_or_raise(url: str) -> None:
 def extract_video_id(url: str) -> Optional[str]:
     """Extrai o ID do vídeo da URL do YouTube."""
     patterns = [
-        r"(?:v=|/)([0-9A-Za-z_-]{11}).*",  # Padrão geral
-        r"youtu\.be/([0-9A-Za-z_-]{11})",   # youtu.be
-        r"embed/([0-9A-Za-z_-]{11})",       # embed
-        r"shorts/([0-9A-Za-z_-]{11})",      # shorts
+        r"(?:v=|/)([0-9A-Za-z_-]{11}).*",
+        r"youtu\.be/([0-9A-Za-z_-]{11})",
+        r"embed/([0-9A-Za-z_-]{11})",
+        r"shorts/([0-9A-Za-z_-]{11})",
     ]
 
     for pattern in patterns:
@@ -187,112 +187,146 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 
-def download_youtube_audio_optimized(url: str) -> str:
+def get_transcript_from_api(video_id: str) -> Optional[str]:
     """
-    Download otimizado de áudio do YouTube com estratégias anti-bot.
+    CAMADA 1: Obtém transcrição usando YouTube Transcript API.
+    Método mais rápido e confiável (não baixa vídeo).
+    """
+    try:
+        # Tentar obter em português primeiro
+        transcript_list = YouTubeTranscriptApi.get_transcript(
+            video_id,
+            languages=['pt', 'pt-BR', 'en']
+        )
+
+        # Juntar todos os textos
+        full_text = " ".join([entry['text'] for entry in transcript_list])
+
+        if full_text.strip():
+            return full_text.strip()
+
+        return None
+
+    except Exception as e:
+        # Se não houver legendas, retornar None para tentar próximo método
+        print(f"YouTube Transcript API falhou: {e}")
+        return None
+
+
+def download_youtube_audio_with_fallbacks(url: str) -> str:
+    """
+    CAMADA 2: Download com múltiplas estratégias de player client.
     """
     temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
     unique = uuid.uuid4().hex[:8]
-
     output_path = os.path.join(temp_dir, f"audio_{unique}.%(ext)s")
 
-    # Configurações anti-detecção de bot
-    ydl_opts = {
-        "outtmpl": output_path,
-        "format": "bestaudio[ext=m4a]/bestaudio/best",  # Apenas áudio
-
-        # === ESTRATÉGIAS ANTI-BOT ===
-
-        # 1. User-Agent moderno e realista
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Cache-Control": "max-age=0",
+    # Lista de configurações para tentar em sequência
+    player_configs = [
+        # Configuração 1: Android client (mais confiável atualmente)
+        {
+            "name": "android",
+            "player_client": ["android"],
+            "player_skip": ["webpage"],
         },
+        # Configuração 2: iOS client
+        {
+            "name": "ios",
+            "player_client": ["ios"],
+            "player_skip": ["webpage"],
+        },
+        # Configuração 3: Web client com embed
+        {
+            "name": "web_embed",
+            "player_client": ["web"],
+            "player_skip": [],
+        },
+        # Configuração 4: Android + Web
+        {
+            "name": "android_web",
+            "player_client": ["android", "web"],
+            "player_skip": ["configs"],
+        },
+    ]
 
-        # 2. Cookies (se disponível)
-        "cookiefile": os.environ.get("YOUTUBE_COOKIES_PATH"),
+    last_error = None
 
-        # 3. Extractor args para YouTube
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],  # Múltiplos clients
-                # Pular verificações pesadas
-                "player_skip": ["webpage", "configs"],
+    for config in player_configs:
+        try:
+            print(f"Tentando com player: {config['name']}")
+
+            ydl_opts = {
+                "outtmpl": output_path,
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+
+                # Headers realistas
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "*/*",
+                    "Referer": "https://www.youtube.com/",
+                },
+
+                # Configuração específica do player
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": config["player_client"],
+                        "player_skip": config["player_skip"],
+                    }
+                },
+
+                # Cookies (se disponível)
+                "cookiefile": os.environ.get("YOUTUBE_COOKIES_PATH"),
+
+                # Rede
+                "socket_timeout": 30,
+                "retries": 2,
+                "fragment_retries": 2,
+
+                # Geral
+                "quiet": False,  # Ver logs para debug
+                "no_warnings": False,
+                "ignoreerrors": False,
+                "nocheckcertificate": True,
+
+                # Limites
+                "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             }
-        },
 
-        # 4. Configurações de rede
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "file_access_retries": 3,
-        "ratelimit": 5_000_000,  # 5MB/s
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-        # 5. Configurações gerais
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "nocheckcertificate": True,
+                downloaded_file = find_downloaded_file(temp_dir)
+                if downloaded_file:
+                    print(f"✅ Sucesso com player: {config['name']}")
+                    return downloaded_file
 
-        # 6. Limites
-        "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
+        except Exception as e:
+            last_error = str(e)
+            print(f"❌ Falhou com player {config['name']}: {e}")
+            continue
 
-        # 7. Pós-processamento mínimo
-        "postprocessors": [],
-        "extract_flat": False,
-
-        # 8. Geo bypass (tenta contornar restrições regionais)
-        "geo_bypass": True,
-        "geo_bypass_country": "US",
-    }
-
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            # Extrair info primeiro (mais leve)
-            info = ydl.extract_info(url, download=False)
-
-            # Verificar duração antes de baixar
-            duration = info.get("duration", 0)
-            if duration > MAX_VIDEO_DURATION:
-                raise ValueError(
-                    f"Vídeo muito longo ({duration}s). Máximo: {MAX_VIDEO_DURATION}s"
-                )
-
-            # Agora sim, baixar
-            ydl.download([url])
-
-            # Localizar arquivo baixado
-            downloaded_file = find_downloaded_file(temp_dir)
-            if not downloaded_file:
-                raise RuntimeError("Arquivo não foi baixado corretamente.")
-
-            return downloaded_file
-
-    except Exception as e:
-        cleanup_files([temp_dir])
-        raise
+    # Se todos falharam, limpar e lançar erro
+    cleanup_files([temp_dir])
+    raise RuntimeError(
+        f"Falha em todos os métodos de download. Último erro: {last_error}"
+    )
 
 
 def find_downloaded_file(directory: str) -> Optional[str]:
     """Localiza o arquivo de áudio baixado."""
     audio_extensions = ('.m4a', '.mp3', '.opus', '.webm', '.ogg', '.wav')
 
-    for filename in os.listdir(directory):
-        if filename.endswith(audio_extensions):
-            return os.path.join(directory, filename)
+    try:
+        for filename in os.listdir(directory):
+            if filename.endswith(audio_extensions):
+                return os.path.join(directory, filename)
+    except Exception:
+        pass
 
     return None
 
@@ -344,14 +378,12 @@ def extract_wav_with_bundled_ffmpeg(input_file_path: str) -> str:
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=300  # 5 minutos
+        timeout=300
     )
 
     if proc.returncode != 0 or not os.path.exists(wav_path):
         stderr = proc.stderr.decode('utf-8', errors='ignore')
-        raise RuntimeError(
-            f"Falha ao extrair áudio: {stderr[:200]}"
-        )
+        raise RuntimeError(f"Falha ao extrair áudio: {stderr[:200]}")
 
     return wav_path
 
@@ -361,15 +393,13 @@ def transcribe_with_whisper_local(file_path: str) -> str:
     wav_path = None
 
     try:
-        # Extrair WAV
         wav_path = extract_wav_with_bundled_ffmpeg(file_path)
 
-        # Otimização para produção
         is_production = os.environ.get("FLASK_ENV") == "production"
         model_size = "tiny" if is_production else os.environ.get(
-            "WHISPER_MODEL", "base")
+            "WHISPER_MODEL", "base"
+        )
 
-        # Carregar modelo
         model = WhisperModel(
             model_size,
             device="cpu",
@@ -377,25 +407,43 @@ def transcribe_with_whisper_local(file_path: str) -> str:
             num_workers=1,
         )
 
-        # Transcrever
         segments, info = model.transcribe(
             wav_path,
             beam_size=1 if is_production else 3,
-            language=None,  # Detecção automática
+            language=None,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
         )
 
-        # Coletar texto
         text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
 
         if not text_parts:
-            return "Nenhuma fala detectada no áudio."
+            return "⚠️ Nenhuma fala detectada no áudio."
 
         return " ".join(text_parts)
 
     finally:
         cleanup_files([wav_path])
+
+
+def format_error_message(error: str) -> str:
+    """Formata mensagens de erro para serem amigáveis ao usuário."""
+    if "Sign in to confirm" in error or "bot" in error.lower():
+        return (
+            "YouTube bloqueou a requisição. "
+            "Tente: (1) Aguardar 10-15 min, (2) Usar outra URL, (3) Upload direto do arquivo."
+        )
+    elif "Video unavailable" in error:
+        return "Vídeo indisponível, privado ou restrito por região."
+    elif "player response" in error.lower():
+        return (
+            "Não foi possível extrair informações do vídeo. "
+            "O vídeo pode ter legendas desabilitadas. Tente fazer upload do arquivo."
+        )
+    elif "Requested format not available" in error:
+        return "Formato de vídeo não disponível para download."
+    else:
+        return error
 
 
 def cleanup_files(paths: list) -> None:
